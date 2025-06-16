@@ -1,14 +1,9 @@
 package com.dynamictecnologies.anomalyproyect
 
 import android.app.Application
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.ImageFormat
-import android.graphics.Matrix
 import androidx.camera.core.ImageProxy
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.framework.image.MPImage
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
@@ -22,10 +17,14 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import timber.log.Timber
-import java.nio.ByteBuffer
 import java.util.Locale
 import javax.inject.Inject
 import kotlin.math.*
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.ImageFormat
+import com.google.mediapipe.framework.image.BitmapImageBuilder
+import java.nio.ByteBuffer
 
 @HiltViewModel
 class HandGestureViewModel @Inject constructor(
@@ -84,157 +83,43 @@ class HandGestureViewModel @Inject constructor(
     }
 
     fun analyzeImage(imageProxy: ImageProxy) {
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                // Crear MPImage desde ImageProxy
-                val mpImage = createMPImageFromImageProxy(imageProxy)
+        val frameTime = imageProxy.imageInfo.timestamp / 1_000_000
 
-                // Obtener el timestamp para el modo LIVE_STREAM
-                val frameTime = System.currentTimeMillis()
+        try {
 
-                handLandmarker?.let { detector ->
-                    // Llamar a detectAsync para el modo LIVE_STREAM
-                    detector.detectAsync(mpImage, frameTime)
-                }
-            } catch (e: Exception) {
-                _gestureState.value = "Error en análisis: ${e.message}"
-                Timber.e(e, "Error analizando imagen")
-            } finally {
-                // Es crucial cerrar ImageProxy después de que MediaPipe la haya procesado
-                imageProxy.close()
-            }
-        }
-    }
+            val bitmap = imageProxy.toBitmap()
+            val mpImage = BitmapImageBuilder(bitmap).build()
 
-    private fun createMPImageFromImageProxy(imageProxy: ImageProxy): MPImage {
-        return try {
-            // Convertir ImageProxy a Bitmap de manera eficiente
-            val bitmap = imageProxyToBitmap(imageProxy)
-            BitmapImageBuilder(bitmap).build()
+            handLandmarker?.detectAsync(mpImage, frameTime)
+
         } catch (e: Exception) {
-            Timber.e(e, "Error creando MPImage desde ImageProxy")
-            // Crear una imagen vacía como fallback
-            val emptyBitmap = Bitmap.createBitmap(1, 1, Bitmap.Config.RGB_565)
-            BitmapImageBuilder(emptyBitmap).build()
+            _gestureState.value = "Error en análisis: ${e.message}"
+            Timber.e(e, "Error analizando imagen")
+        } finally {
+            imageProxy.close()
         }
     }
 
     private fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap {
-        return when (imageProxy.format) {
-            ImageFormat.YUV_420_888 -> {
-                yuvToRgbBitmap(imageProxy)
-            }
-            ImageFormat.NV21 -> {
-                nv21ToBitmap(imageProxy)
-            }
-            ImageFormat.JPEG -> {
-                jpegToBitmap(imageProxy)
-            }
-            else -> {
-                Timber.w("Formato no soportado: ${imageProxy.format}, usando conversión genérica")
-                convertImageProxyToBitmap(imageProxy)
-            }
-        }
-    }
-
-    private fun yuvToRgbBitmap(imageProxy: ImageProxy): Bitmap {
-        val yBuffer = imageProxy.planes[0].buffer
-        val uBuffer = imageProxy.planes[1].buffer
-        val vBuffer = imageProxy.planes[2].buffer
+        val yBuffer = imageProxy.planes[0].buffer // Y
+        val vuBuffer = imageProxy.planes[2].buffer // V
+        val uBuffer = imageProxy.planes[1].buffer // U
 
         val ySize = yBuffer.remaining()
+        val vuSize = vuBuffer.remaining()
         val uSize = uBuffer.remaining()
-        val vSize = vBuffer.remaining()
 
-        val yuvBytes = ByteArray(ySize + uSize + vSize)
+        val nv21 = ByteArray(ySize + vuSize + uSize)
 
-        yBuffer.get(yuvBytes, 0, ySize)
-        uBuffer.get(yuvBytes, ySize, uSize)
-        vBuffer.get(yuvBytes, ySize + uSize, vSize)
+        yBuffer.get(nv21, 0, ySize)
+        vuBuffer.get(nv21, ySize, vuSize)
+        uBuffer.get(nv21, ySize + vuSize, uSize)
 
-        val yuvImage = android.media.Image.Plane::class.java
-        // Usar YuvImage para convertir a RGB
-        val rs = android.renderscript.RenderScript.create(getApplication())
-        val scriptIntrinsicYuvToRGB = android.renderscript.ScriptIntrinsicYuvToRGB.create(
-            rs, android.renderscript.Element.U8_4(rs)
-        )
-
-        val yuvType = android.renderscript.Type.Builder(rs, android.renderscript.Element.U8(rs))
-            .setX(yuvBytes.size)
-        val inputAllocation = android.renderscript.Allocation.createTyped(
-            rs, yuvType.create(), android.renderscript.Allocation.USAGE_SCRIPT
-        )
-
-        val rgbaType = android.renderscript.Type.Builder(rs, android.renderscript.Element.RGBA_8888(rs))
-            .setX(imageProxy.width).setY(imageProxy.height)
-        val outputAllocation = android.renderscript.Allocation.createTyped(
-            rs, rgbaType.create(), android.renderscript.Allocation.USAGE_SCRIPT
-        )
-
-        inputAllocation.copyFrom(yuvBytes)
-        scriptIntrinsicYuvToRGB.setInput(inputAllocation)
-        scriptIntrinsicYuvToRGB.forEach(outputAllocation)
-
-        val bitmap = Bitmap.createBitmap(imageProxy.width, imageProxy.height, Bitmap.Config.ARGB_8888)
-        outputAllocation.copyTo(bitmap)
-
-        // Limpiar recursos
-        rs.destroy()
-
-        return rotateBitmap(bitmap, imageProxy.imageInfo.rotationDegrees)
-    }
-
-    private fun nv21ToBitmap(imageProxy: ImageProxy): Bitmap {
-        val buffer = imageProxy.planes[0].buffer
-        val bytes = ByteArray(buffer.remaining())
-        buffer.get(bytes)
-
-        val yuvImage = android.graphics.YuvImage(
-            bytes, ImageFormat.NV21,
-            imageProxy.width, imageProxy.height, null
-        )
-
-        val outputStream = java.io.ByteArrayOutputStream()
-        yuvImage.compressToJpeg(
-            android.graphics.Rect(0, 0, imageProxy.width, imageProxy.height),
-            100, outputStream
-        )
-
-        val jpegBytes = outputStream.toByteArray()
-        val bitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
-
-        return rotateBitmap(bitmap, imageProxy.imageInfo.rotationDegrees)
-    }
-
-    private fun jpegToBitmap(imageProxy: ImageProxy): Bitmap {
-        val buffer = imageProxy.planes[0].buffer
-        val bytes = ByteArray(buffer.remaining())
-        buffer.get(bytes)
-        val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-        return rotateBitmap(bitmap, imageProxy.imageInfo.rotationDegrees)
-    }
-
-    private fun convertImageProxyToBitmap(imageProxy: ImageProxy): Bitmap {
-        val buffer: ByteBuffer = imageProxy.planes[0].buffer
-        val bytes = ByteArray(buffer.remaining())
-        buffer.get(bytes)
-        val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-        return rotateBitmap(bitmap ?: createEmptyBitmap(), imageProxy.imageInfo.rotationDegrees)
-    }
-
-    private fun rotateBitmap(bitmap: Bitmap, rotationDegrees: Int): Bitmap {
-        if (rotationDegrees == 0) return bitmap
-
-        val matrix = Matrix()
-        matrix.postRotate(rotationDegrees.toFloat())
-
-        return Bitmap.createBitmap(
-            bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true
-        )
-    }
-
-    private fun createEmptyBitmap(): Bitmap {
-        return Bitmap.createBitmap(1, 1, Bitmap.Config.RGB_565)
+        val yuvImage = android.graphics.YuvImage(nv21, ImageFormat.NV21, imageProxy.width, imageProxy.height, null)
+        val out = java.io.ByteArrayOutputStream()
+        yuvImage.compressToJpeg(android.graphics.Rect(0, 0, imageProxy.width, imageProxy.height), 100, out)
+        val imageBytes = out.toByteArray()
+        return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
     }
 
     // Callback para los resultados de MediaPipe
@@ -243,11 +128,11 @@ class HandGestureViewModel @Inject constructor(
             if (result.landmarks().isNotEmpty()) {
                 // Obtener la primera mano
                 val handLandmarks: List<NormalizedLandmark> = result.landmarks()[0]
-
-                // Invertir el eje X para corregir el efecto espejo
                 val correctedLandmarks = handLandmarks.map { landmark ->
                     NormalizedLandmark.create(1f - landmark.x(), landmark.y(), landmark.z())
                 }
+
+                val landmarks = handLandmarks
 
                 _landmarksCount.value = correctedLandmarks.size
 
@@ -404,26 +289,22 @@ class HandGestureViewModel @Inject constructor(
     private fun detectFingersExtended(landmarks: List<NormalizedLandmark>): List<Boolean> {
         val fingersExtended = mutableListOf<Boolean>()
 
-        // Pulgar - lógica mejorada
-        val thumbExtended = isThumbExtended(landmarks)
+        // Pulgar - usar distancia desde muñeca
+        val thumbExtended = distance(landmarks[4], landmarks[0]) > distance(landmarks[3], landmarks[0])
         fingersExtended.add(thumbExtended)
 
-        // Otros dedos - comparar tip con MCP (base del dedo)
-        val fingerIndices = listOf(
-            Pair(8, 5),   // Índice: tip vs MCP
-            Pair(12, 9),  // Medio: tip vs MCP
-            Pair(16, 13), // Anular: tip vs MCP
-            Pair(20, 17)  // Meñique: tip vs MCP
+        // Otros dedos - usar articulaciones intermedias, no solo Y
+        val fingerData = listOf(
+            Triple(8, 6, 5),   // Índice: tip, pip, mcp
+            Triple(12, 10, 9), // Medio: tip, pip, mcp
+            Triple(16, 14, 13),// Anular: tip, pip, mcp
+            Triple(20, 18, 17) // Meñique: tip, pip, mcp
         )
 
-        fingerIndices.forEach { (tipIndex, mcpIndex) ->
-            val tip = landmarks[tipIndex]
-            val mcp = landmarks[mcpIndex]
-
-            // Un dedo está extendido si el tip está ARRIBA del MCP (menor Y)
-            // En coordenadas de imagen: Y=0 está arriba, Y=1 está abajo
-            val extended = tip.y() < mcp.y()
-            fingersExtended.add(extended)
+        fingerData.forEach { (tip, pip, mcp) ->
+            val tipToMcp = distance(landmarks[tip], landmarks[mcp])
+            val pipToMcp = distance(landmarks[pip], landmarks[mcp])
+            fingersExtended.add(tipToMcp > pipToMcp * 1.1f)
         }
 
         return fingersExtended

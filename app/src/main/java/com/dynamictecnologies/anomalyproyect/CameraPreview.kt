@@ -39,8 +39,6 @@ fun CameraPreview(
         factory = { ctx ->
             PreviewView(ctx).apply {
                 this.controller = cameraController
-
-                // Configurar el analizador de imágenes
                 cameraController.setImageAnalysisAnalyzer(
                     ContextCompat.getMainExecutor(ctx)
                 ) { imageProxy ->
